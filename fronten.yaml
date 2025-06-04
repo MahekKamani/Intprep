@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for EC2, ALB, and ASG for Interview Coach.
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID from network stack
+  PublicSubnetId1:
+    Type: String
+    Description: Public Subnet ID in us-east-1a from network stack
+  PublicSubnetId2:
+    Type: String
+    Description: Public Subnet ID in us-east-1b from network stack
+  EC2SecurityGroupId:
+    Type: String
+    Description: Existing Security Group ID for EC2 instances
+  ALBSecurityGroupId:
+    Type: String
+    Description: Existing Security Group ID for ALB
+
+Resources:
+  # Application Load Balancer
+  InterviewCoachALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref PublicSubnetId1
+        - !Ref PublicSubnetId2
+      SecurityGroups:
+        - !Ref ALBSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: InterviewCoachALB
+        - Key: Project
+          Value: InterviewCoach
+
+  # ALB Target Group
+  InterviewCoachTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: InterviewCoachTargetGroup
+        - Key: Project
+          Value: InterviewCoach
+
+  # ALB Listener
+  InterviewCoachListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref InterviewCoachTargetGroup
+      LoadBalancerArn: !Ref InterviewCoachALB
+      Port: 80
+      Protocol: HTTP
+      Tags:
+        - Key: Name
+          Value: InterviewCoachListener
+        - Key: Project
+          Value: InterviewCoach
+
+  # EC2 Launch Template
+  InterviewCoachLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: InterviewCoachLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0c101f26f147fa7fd # Amazon Linux 2 AMI for us-east-1; verify availability
+        InstanceType: t2.micro
+        KeyName: MyInterviewCoachKey
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            SubnetId: !Ref PublicSubnetId1
+            Groups:
+              - !Ref EC2SecurityGroupId
+        # REMOVE SecurityGroupIds from here!
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: InterviewCoachEC2
+              - Key: Project
+                Value: InterviewCoach
+
+  # Auto Scaling Group
+  InterviewCoachASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetId1
+        - !Ref PublicSubnetId2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref InterviewCoachLaunchTemplate
+        Version: !GetAtt InterviewCoachLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref InterviewCoachTargetGroup
+      Tags:
+        - Key: Name
+          Value: InterviewCoachASG
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: InterviewCoach
+          PropagateAtLaunch: true
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+Outputs:
+  ALBUrl:
+    Description: The URL of the Application Load Balancer
+    Value: !GetAtt InterviewCoachALB.DNSName
+    Export:
+      Name: InterviewCoach-ALB-URL
+
+  TargetGroupArn:
+    Description: The ARN of the Target Group
+    Value: !Ref InterviewCoachTargetGroup
+    Export:
+      Name: InterviewCoach-TargetGroup-Arn
