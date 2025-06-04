@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SageMaker and OpenSearch for RAG Interview Question Generator (us-east-1)
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID from network stack
+  PublicSubnetId:
+    Type: String
+    Description: Public subnet ID from network stack
+  PrivateSubnetId:
+    Type: String
+    Description: Private subnet ID from network stack
+
+Resources:
+  # SageMaker Execution Role
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RAG-SageMaker-Role-1
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SageMakerAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: RAG-SageMaker-Role-1
+
+  # OpenSearch Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: rag-opensearch
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: t3.small.search
+        InstanceCount: 1
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      VPCOptions:
+        SubnetIds:
+          - !Ref PrivateSubnetId
+        SecurityGroupIds:
+          - !ImportValue RAG-PrivateSecurityGroupId
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt SageMakerRole.Arn
+            Action: es:*
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/rag-opensearch/*
+      Tags:
+        - Key: Name
+          Value: RAG-OpenSearch
+
+  # SageMaker Model for Question Generation (Endpoint)
+  SageMakerModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: RAG-FlanT5Small-Model
+      ExecutionRoleArn: !GetAtt SageMakerRole.Arn
+      PrimaryContainer:
+        Image: 763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:2.0.0-transformers4.28.1-gpu-py310-cu118-ubuntu20.04
+        Environment:
+          HF_MODEL_ID: google/flan-t5-small
+          HF_TASK: text-generation
+      Tags:
+        - Key: Name
+          Value: RAG-FlanT5Small-Model
+
+  SageMakerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: RAG-FlanT5Small-EndpointConfig
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt SageMakerModel.ModelName
+          InstanceType: ml.t2.medium
+          InitialInstanceCount: 1
+      Tags:
+        - Key: Name
+          Value: RAG-FlanT5Small-EndpointConfig
+
+  SageMakerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: RAG-FlanT5Small-Endpoint
+      EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Name
+          Value: RAG-FlanT5Small-Endpoint
+
+Outputs:
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch Domain Endpoint for vector storage
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: RAG-OpenSearchDomainEndpoint
+  SageMakerEndpointName:
+    Description: SageMaker Endpoint Name for question generation
+    Value: !Ref SageMakerEndpoint
+    Export:
+      Name: RAG-SageMakerEndpointName

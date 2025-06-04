@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cognito User Pool for RAG Interview Question Generator (us-east-1)
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID from network stack
+
+Resources:
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: RAG-UserPool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      MfaConfiguration: "OFF"  # Corrected value
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: RAG-UserPool-Client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      CallbackURLs:
+        - https://rag.example.com/callback
+      LogoutURLs:
+        - https://rag.example.com/logout
+      SupportedIdentityProviders:
+        - COGNITO
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: RAG-API
+      Description: Placeholder API Gateway for Cognito integration (expanded in api-gateway-lambda.yaml)
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: RAG-Cognito-Authorizer
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref RestApi
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID for authentication
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: RAG-UserPoolId
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID for API Gateway
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: RAG-UserPoolClientId
+  AuthorizerId:
+    Description: Cognito Authorizer ID for API Gateway
+    Value: !Ref CognitoAuthorizer
+    Export:
+      Name: RAG-AuthorizerId
+  RestApiId:
+    Description: Placeholder API Gateway ID (expanded later)
+    Value: !Ref RestApi
+    Export:
+      Name: RAG-RestApiId
+  RootResourceId:
+    Description: API Gateway Root Resource ID
+    Value: !GetAtt RestApi.RootResourceId
+    Export:
+      Name: RAG-RootResourceId

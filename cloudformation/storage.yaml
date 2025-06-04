@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 Backend storage for RAG Interview Question Generator
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID from network stack
+  BucketName:
+    Type: String
+    Default: rag-job-bucket
+    Description: Name of the S3 bucket (must be globally unique)
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: RAG-S3-Bucket
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: s3:*
+            Resource: !Sub ${S3Bucket.Arn}/*
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: !Sub ${S3Bucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  BucketName:
+    Description: S3 Bucket name for storing job descriptions and questions
+    Value: !Ref S3Bucket
+    Export:
+      Name: RAG-BucketName
+  BucketArn:
+    Description: S3 Bucket ARN for IAM policies
+    Value: !GetAtt S3Bucket.Arn
+    Export:
+      Name: RAG-BucketArn

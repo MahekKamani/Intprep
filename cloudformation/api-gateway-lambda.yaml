@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: API Gateway and Lambda for RAG Interview Question Generator (us-east-1)
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID from network stack
+  PublicSubnetId:
+    Type: String
+    Description: Public Subnet ID from network stack
+  PrivateSubnetId:
+    Type: String
+    Description: Private Subnet ID from network stack
+  S3BucketName:
+    Type: String
+    Description: S3 Bucket Name from storage stack
+  OpenSearchDomainEndpoint:
+    Type: String
+    Description: OpenSearch Domain Endpoint from sagemaker-opensearch stack
+  SageMakerEndpointName:
+    Type: String
+    Description: SageMaker Endpoint Name from sagemaker-opensearch stack
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID from authentication stack
+  UserPoolClientId:
+    Type: String
+    Description: Cognito User Pool Client ID from authentication stack
+  AuthorizerId:
+    Type: String
+    Description: Cognito Authorizer ID from authentication stack
+  RestApiId:
+    Type: String
+    Description: API Gateway ID from authentication stack
+  RootResourceId:
+    Type: String
+    Description: API Gateway Root Resource ID from authentication stack
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RAG-Lambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action: sagemaker:InvokeEndpoint
+                Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}
+              - Effect: Allow
+                Action: es:ESHttp*
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/rag-opensearch/*
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: RAG-Lambda-Role
+
+  # Lambda Function for Input Validation
+  ValidateInputLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RAG-ValidateInput
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  query = body.get('query')
+                  if not query or not isinstance(query, str) or len(query.strip()) < 5:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid query: must be a non-empty string with at least 5 characters'})
+                      }
+                  
+                  s3_key = f"queries/{uuid.uuid4()}.json"
+                  s3.put_object(
+                      Bucket=os.environ['BUCKET_NAME'],  # Fixed to use environment variable
+                      Key=s3_key,
+                      Body=json.dumps({'query': query}),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Query validated and stored', 's3_key': s3_key})
+                  }
+              
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'S3 error: {str(e)}'})
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Internal error: {str(e)}'})
+                  }
+      Runtime: python3.9
+      Timeout: 120
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetId
+        SecurityGroupIds:
+          - !ImportValue RAG-PrivateSecurityGroupId
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3BucketName
+      Tags:
+        - Key: Name
+          Value: RAG-ValidateInput
+
+  # Lambda Function for Question Generation
+  QuestionGeneratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RAG-QuestionGenerator
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          
+          http = urllib3.PoolManager()
+          
+          def handler(event, context):
+              # Extract query from API Gateway event
+              body = json.loads(event['body']) if event.get('body') else {}
+              query = body.get('query', '')
+              if not query:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Query is required'})
+                  }
+              
+              # Query OpenSearch for relevant documents
+              os_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+              os_url = f"https://{os_endpoint}/rag-index/_search"
+              os_query = {
+                  "query": {
+                      "match": {
+                          "content": query
+                      }
+                  }
+              }
+              try:
+                  response = http.request(
+                      'POST',
+                      os_url,
+                      body=json.dumps(os_query),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  os_results = json.loads(response.data.decode('utf-8'))
+                  hits = os_results.get('hits', {}).get('hits', [])
+                  context = ' '.join([hit['_source']['content'] for hit in hits[:3]])
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'OpenSearch error: {str(e)}'})
+                  }
+              
+              # Invoke SageMaker for question generation
+              sagemaker = boto3.client('sagemaker-runtime')
+              endpoint_name = os.environ['SAGEMAKER_ENDPOINT']
+              prompt = f"Generate an interview question based on this context: {context}"
+              try:
+                  sagemaker_response = sagemaker.invoke_endpoint(
+                      EndpointName=endpoint_name,
+                      ContentType='application/json',
+                      Body=json.dumps({'inputs': prompt})
+                  )
+                  question = json.loads(sagemaker_response['Body'].read().decode('utf-8'))['generated_text']
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'SageMaker error: {str(e)}'})
+                  }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'question': question})
+              }
+      Runtime: python3.9
+      Timeout: 120
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetId
+        SecurityGroupIds:
+          - !ImportValue RAG-PrivateSecurityGroupId
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchDomainEndpoint
+          SAGEMAKER_ENDPOINT: !Ref SageMakerEndpointName
+          BUCKET_NAME: !Ref S3BucketName
+      Tags:
+        - Key: Name
+          Value: RAG-QuestionGenerator
+
+  # API Gateway Resource (/validate)
+  ValidateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApiId
+      ParentId: !Ref RootResourceId
+      PathPart: validate
+
+  # API Gateway Method (POST /validate)
+  ValidateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApiId
+      ResourceId: !Ref ValidateResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizerId
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ValidateInputLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Gateway Resource (/questions)
+  QuestionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApiId
+      ParentId: !Ref RootResourceId
+      PathPart: questions
+
+  # API Gateway Method (POST /questions)
+  QuestionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApiId
+      ResourceId: !Ref QuestionsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AuthorizerId
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QuestionGeneratorLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ValidateMethod
+      - QuestionsMethod
+    Properties:
+      RestApiId: !Ref RestApiId
+      StageName: prod
+
+  # Lambda Permissions for API Gateway
+  ValidatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ValidateInputLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/POST/validate
+
+  QuestionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QuestionGeneratorLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/POST/questions
+
+Outputs:
+  RAGValidateEndpoint:
+    Description: API Gateway endpoint for input validation
+    Value: !Sub https://${RestApiId}.execute-api.${AWS::Region}.amazonaws.com/prod/validate
+    Export:
+      Name: RAG-ValidateEndpoint
+  RAGApiEndpoint:
+    Description: API Gateway endpoint for questions
+    Value: !Sub https://${RestApiId}.execute-api.${AWS::Region}.amazonaws.com/prod/questions
+    Export:
+      Name: RAG-ApiEndpoint
